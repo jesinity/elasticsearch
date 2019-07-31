@@ -67,9 +67,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
@@ -272,26 +270,30 @@ public class RestClient implements Closeable {
      * will be retried). In case of failures all of the alive nodes (or dead
      * nodes that deserve a retry) are retried until one responds or none of
      * them does, in which case an {@link IOException} will be thrown.
-     *
-     * @param request the request to perform
+     *  @param request the request to perform
      * @param responseListener the {@link ResponseListener} to notify when the
-     *      request is completed or fails
+     * @return
      */
-    public void performRequestAsync(Request request, ResponseListener responseListener) {
+    public CancellationToken performRequestAsync(Request request, ResponseListener responseListener) {
+        CancellationToken token = null;
         try {
             FailureTrackingResponseListener failureTrackingResponseListener = new FailureTrackingResponseListener(responseListener);
             InternalRequest internalRequest = new InternalRequest(request);
-            performRequestAsync(nextNodes(), internalRequest, failureTrackingResponseListener);
+            Future<HttpResponse> response =  performRequestAsync(nextNodes(), internalRequest, failureTrackingResponseListener);
+            token = new CancellationToken(response);
         } catch (Exception e) {
+            token = new CancellationToken(e);
             responseListener.onFailure(e);
         }
+        return token;
     }
 
-    private void performRequestAsync(final NodeTuple<Iterator<Node>> nodeTuple,
+    private Future<HttpResponse> performRequestAsync(final NodeTuple<Iterator<Node>> nodeTuple,
                                      final InternalRequest request,
                                      final FailureTrackingResponseListener listener) {
+
         final RequestContext context = request.createContextForNextAttempt(nodeTuple.nodes.next(), nodeTuple.authCache);
-        client.execute(context.requestProducer, context.asyncResponseConsumer, context.context, new FutureCallback<HttpResponse>() {
+        Future<HttpResponse> requestHandle = client.execute(context.requestProducer, context.asyncResponseConsumer, context.context, new FutureCallback<HttpResponse>() {
             @Override
             public void completed(HttpResponse httpResponse) {
                 try {
@@ -306,7 +308,7 @@ public class RestClient implements Closeable {
                             listener.onDefinitiveFailure(responseOrResponseException.responseException);
                         }
                     }
-                } catch(Exception e) {
+                } catch (Exception e) {
                     listener.onDefinitiveFailure(e);
                 }
             }
@@ -322,7 +324,7 @@ public class RestClient implements Closeable {
                     } else {
                         listener.onDefinitiveFailure(failure);
                     }
-                } catch(Exception e) {
+                } catch (Exception e) {
                     listener.onDefinitiveFailure(e);
                 }
             }
@@ -332,6 +334,8 @@ public class RestClient implements Closeable {
                 listener.onDefinitiveFailure(new ExecutionException("request was cancelled", null));
             }
         });
+
+        return requestHandle;
     }
 
     /**
@@ -733,7 +737,30 @@ public class RestClient implements Closeable {
         return ignoreErrorCodes;
     }
 
-    private static class ResponseOrResponseException {
+    static class CancellationToken {
+
+        private final Future<HttpResponse> response;
+        private final Exception cause;
+
+        CancellationToken(Future<HttpResponse> response) {
+            this.response = response;
+            this.cause = null;
+        }
+
+        CancellationToken(Exception cause) {
+            this.response = null;
+            this.cause = cause;
+        }
+
+        public void cancel(boolean mayInterruptIfRunning) throws Exception {
+            if (cause!= null){
+               throw  RestClient.extractAndWrapCause(cause);
+            }
+            response.cancel(mayInterruptIfRunning);
+        }
+    }
+
+    static class ResponseOrResponseException {
         private final Response response;
         private final ResponseException responseException;
 
